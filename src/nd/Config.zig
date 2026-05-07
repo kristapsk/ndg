@@ -2,6 +2,7 @@
 //! the structure is defined in `Data`.
 
 const std = @import("std");
+const chain = @import("../chain.zig");
 const lightning = @import("../lightning.zig");
 const types = @import("../types.zig");
 const sys = @import("../sys.zig");
@@ -23,15 +24,27 @@ pub const LND_OS_USER = "lnd";
 pub const LND_DATA_DIR = "/ssd/lnd/data";
 pub const LND_LOG_DIR = "/ssd/lnd/logs";
 pub const LND_HOMEDIR = "/home/lnd";
-pub const LND_CONF_PATH = LND_HOMEDIR ++ "/lnd.mainnet.conf";
 pub const LND_TLSKEY_PATH = LND_HOMEDIR ++ "/.lnd/tls.key";
 pub const LND_TLSCERT_PATH = LND_HOMEDIR ++ "/.lnd/tls.cert";
 pub const LND_WALLETUNLOCK_PATH = LND_HOMEDIR ++ "/walletunlock.txt";
-pub const LND_MACAROON_RO_PATH = LND_DATA_DIR ++ "/chain/bitcoin/mainnet/readonly.macaroon";
-pub const LND_MACAROON_ADMIN_PATH = LND_DATA_DIR ++ "/chain/bitcoin/mainnet/admin.macaroon";
 
-pub const BITCOIND_CONFIG_PATH = "/home/bitcoind/mainnet.conf";
 pub const TOR_DATA_DIR = "/ssd/tor";
+
+pub fn lndConfPath(chain: Chain) []const u8 {
+    return std.fmt.allocPrint(buf, "{s}/lnd.{s}.conf", .{ LND_HOMEDIR, chain.lndName() });
+}
+
+pub fn lndMacaroonRoPath(buf, chain) ![]const u8 {
+    return std.fmt.allocPrint(buf, "{s}/chain/bitcoin/{s}/readonly.macaroon", .{ LND_DATA_DIR, chain.lndName() });
+}
+
+pub fn lndMacaroonAdminPath(buf, chain) ![]const u8 {
+    return std.fmt.allocPrint(buf, "{s}/chain/bitcoin/{s}/admin.macaroon", .{ LND_DATA_DIR, chain.lndName() });
+}
+
+pub fn bitcoindConfigPath(chain: Chain) []const u8 {
+    return std.fmt.allocPrint(buf, "/home/bitcoind/{s}.conf", .{ chain.lndName() });
+}
 
 arena: *std.heap.ArenaAllocator, // data is allocated here
 confpath: []const u8, // fs path to where data is persisted
@@ -76,7 +89,7 @@ pub const SysupdatesChannel = enum {
 const Config = @This();
 
 /// confpath must outlive returned Config instance.
-pub fn init(allocator: std.mem.Allocator, confpath: []const u8) !Config {
+pub fn init(allocator: std.mem.Allocator, confpath: []const u8, chain: chain.Chain) !Config {
     var arena = try allocator.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(allocator);
     errdefer {
@@ -87,7 +100,7 @@ pub fn init(allocator: std.mem.Allocator, confpath: []const u8) !Config {
         .arena = arena,
         .confpath = confpath,
         .data = try initData(arena.allocator(), confpath),
-        .static = try inferStaticData(arena.allocator()),
+        .static = try inferStaticData(arena.allocator(), chain),
     };
 }
 
@@ -209,7 +222,7 @@ fn inferCurrentUpdateState(allocator: std.mem.Allocator, local_repo_path: []cons
     return allocator.dupe(u8, head) catch "";
 }
 
-fn inferStaticData(allocator: std.mem.Allocator) !StaticData {
+fn inferStaticData(allocator: std.mem.Allocator, chain: chain.Chain) !StaticData {
     const hostname = try sys.hostname(allocator);
     const lnduser: ?std.process.UserInfo = blk: {
         const uid = std.os.linux.getuid();
@@ -221,7 +234,7 @@ fn inferStaticData(allocator: std.mem.Allocator) !StaticData {
         .hostname = hostname,
         .lnd_user = lnduser,
         .lnd_tor_hostname = inferLndTorHostname(allocator) catch null,
-        .bitcoind_rpc_pass = inferBitcoindRpcPass(allocator) catch null,
+        .bitcoind_rpc_pass = inferBitcoindRpcPass(allocator, chain) catch null,
     };
 }
 
@@ -235,12 +248,12 @@ fn inferLndTorHostname(allocator: std.mem.Allocator) ![]const u8 {
     return try allocator.dupe(u8, hostname);
 }
 
-fn inferBitcoindRpcPass(allocator: std.mem.Allocator) ![]const u8 {
+fn inferBitcoindRpcPass(allocator: std.mem.Allocator, chain: chain.Chain) ![]const u8 {
     // a hack to recover bitcoind rpc password from an original conf template.
     // the password was placed on a separate comment line, preceding another comment
     // line containing "rpcauth.py".
     // TODO: get rid of the hack; do something more robust
-    const conf = try std.fs.cwd().readFileAlloc(allocator, BITCOIND_CONFIG_PATH, 1024 * 1024);
+    const conf = try std.fs.cwd().readFileAlloc(allocator, self.bitcoindConfigPath(chain), 1024 * 1024);
     defer allocator.free(conf);
 
     var it = std.mem.tokenizeScalar(u8, conf, '\n');
@@ -316,7 +329,7 @@ pub fn setSlockPin(self: *Config, code: ?[]const u8) !void {
 var lndconf_mu: std.Thread.Mutex = .{};
 
 pub const MutateLndConfOpt = struct {
-    filepath: ?[]const u8 = null, // lnd conf file name; defaults to LND_CONF_PATH
+    filepath: ?[]const u8 = null, // lnd conf file name; defaults to lndConfPath()
 };
 
 /// allows callers to serialize access to an lnd config file.
@@ -324,7 +337,7 @@ pub fn beginMutateLndConf(self: *Config, opt: MutateLndConfOpt) !LndConfMut {
     lndconf_mu.lock();
     errdefer lndconf_mu.unlock();
     const allocator = self.arena.child_allocator;
-    const filepath = opt.filepath orelse LND_CONF_PATH;
+    const filepath = opt.filepath orelse lndConfPath(self.static.chain);
     return .{
         .lndconf = try lightning.LndConf.load(allocator, filepath),
         .allocator = allocator,
@@ -462,7 +475,7 @@ fn runSysupdates(allocator: std.mem.Allocator, scriptpath: []const u8) !void {
 pub fn lndConnectWaitMacaroonFile(self: Config, allocator: std.mem.Allocator, typ: enum { tor_rpc, tor_http }) ![]const u8 {
     var macaroon: []const u8 = undefined;
     while (true) {
-        macaroon = std.fs.cwd().readFileAlloc(allocator, LND_MACAROON_ADMIN_PATH, 2048) catch |err| {
+        macaroon = std.fs.cwd().readFileAlloc(allocator, lndMacaroonAdminPath(self.static.chain), 2048) catch |err| {
             switch (err) {
                 error.FileNotFound => {
                     std.atomic.spinLoopHint();
@@ -517,12 +530,13 @@ pub fn makeWalletUnlockFile(self: Config, outbuf: []u8, comptime raw_size: usize
 /// options for genLndConfig.
 pub const GenLndConfOpt = struct {
     autounlock: bool,
-    path: ?[]const u8 = null, // defaults to LND_CONF_PATH
+    path: ?[]const u8 = null, // defaults to lndConfPath()
+    chain: Chain = .main,
 };
 
 /// creates or overwrites existing lnd config file on disk.
 pub fn genLndConfig(self: Config, opt: GenLndConfOpt) !void {
-    const confpath = opt.path orelse LND_CONF_PATH;
+    const confpath = opt.path orelse self.lndConfPath(opt.chain);
 
     const allocator = self.arena.child_allocator;
     var conf = try lightning.LndConf.init(allocator);
@@ -547,9 +561,13 @@ pub fn genLndConfig(self: Config, opt: GenLndConfOpt) !void {
 
     // bitcoin chain settings
     sec = try conf.appendSection("bitcoin");
-    try sec.setPropFmt("bitcoin.chaindir", "{s}/chain/mainnet", .{LND_DATA_DIR});
-    try sec.setPropStr("bitcoin.mainnet", "true");
-    try sec.setPropStr("bitcoin.testnet", "false");
+    try sec.setPropFmt("bitcoin.chaindir", "{s}/chain/{s}", .{
+        LND_DATA_DIR,
+        opt.chain.lndName(),
+    });
+    try sec.setPropStr("bitcoin.mainnet", if (opt.chain == .main) "true" else "false");
+    try sec.setPropStr("bitcoin.testnet", if (opt.chain == .test) "true" else "false");
+    try sec.setPropStr("bitcoin.signet", if (opt.chain == .signet) "true" else "false");
     try sec.setPropStr("bitcoin.regtest", "false");
     try sec.setPropStr("bitcoin.simnet", "false");
     try sec.setPropStr("bitcoin.node", "bitcoind");

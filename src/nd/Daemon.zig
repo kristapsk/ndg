@@ -16,6 +16,7 @@ const mem = std.mem;
 const time = std.time;
 
 const bitcoindrpc = @import("../bitcoindrpc.zig");
+const chain = @import("../chain.zig");
 const comm = @import("../comm.zig");
 const Config = @import("Config.zig");
 const lndhttp = @import("../lightning.zig").lndhttp;
@@ -27,6 +28,7 @@ const types = @import("../types.zig");
 const logger = std.log.scoped(.daemon);
 
 allocator: mem.Allocator,
+chain: chain.Chain,
 conf: Config,
 uireader: std.fs.File.Reader, // ngui stdout
 uiwriter: std.fs.File.Writer, // ngui stdin
@@ -124,6 +126,7 @@ const Error = error{
 
 const InitOpt = struct {
     allocator: std.mem.Allocator,
+    chain: chain.Chain,
     conf: Config,
     uir: std.fs.File.Reader,
     uiw: std.fs.File.Writer,
@@ -148,6 +151,7 @@ pub fn init(opt: InitOpt) !Daemon {
 
     var d: Daemon = .{
         .allocator = opt.allocator,
+        .chain = opt.chain,
         .conf = opt.conf,
         .uireader = opt.uir,
         .uiwriter = opt.uiw,
@@ -844,12 +848,18 @@ const OnchainStats = struct {
     balance: ?lndhttp.Client.Result(.walletbalance),
 };
 
+fn bitcoindCookiePath(self: *Daemon) ![]const u8 {
+    return std.fmt.allocPrint(self.allocator, "/ssd/bitcoind/{s}/.cookie", .{ self.chain.lndName() });
+}
+
 /// call site must hold self.mu due to self.state read access.
 /// callers own returned value.
 fn fetchOnchainStats(self: *Daemon) !OnchainStats {
     var client = bitcoindrpc.Client{
         .allocator = self.allocator,
-        .cookiepath = "/ssd/bitcoind/mainnet/.cookie",
+        .cookiepath = try self.bitcoindCookiePath(),
+        .port = self.chain.bitcoindRpcPort(),
+//        .cookiepath = "/ssd/bitcoind/mainnet/.cookie",
     };
     const bcinfo = try client.call(.getblockchaininfo, {});
     const netinfo = try client.call(.getnetworkinfo, {});
@@ -862,8 +872,8 @@ fn fetchOnchainStats(self: *Daemon) !OnchainStats {
         var lndc = lndhttp.Client.init(.{
             .allocator = self.allocator,
             .tlscert_path = Config.LND_TLSCERT_PATH,
-            .macaroon_ro_path = Config.LND_MACAROON_RO_PATH,
-            .macaroon_admin_path = Config.LND_MACAROON_ADMIN_PATH,
+            .macaroon_ro_path = Config.lndMacaroonRoPath(self.chain),
+            .macaroon_admin_path = Config.lndMacaroonAdminPath(self.chain),
         }) catch break :blk null;
         defer lndc.deinit();
         const res = lndc.call(.walletbalance, {}) catch break :blk null;
@@ -881,8 +891,8 @@ fn sendLightningReport(self: *Daemon) !void {
     var client = try lndhttp.Client.init(.{
         .allocator = self.allocator,
         .tlscert_path = Config.LND_TLSCERT_PATH,
-        .macaroon_ro_path = Config.LND_MACAROON_RO_PATH,
-        .macaroon_admin_path = Config.LND_MACAROON_ADMIN_PATH,
+        .macaroon_ro_path = Config.lndMacaroonRoPath(self.chain),
+        .macaroon_admin_path = Config.lndMacaroonAdminPath(self.chain),
     });
     defer client.deinit();
 

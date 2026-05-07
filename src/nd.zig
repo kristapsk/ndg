@@ -62,6 +62,7 @@ const Address = std.net.Address;
 
 const nif = @import("nif");
 
+const chain = @import("chain.zig");
 const comm = @import("comm.zig");
 const Config = @import("nd/Config.zig");
 const Daemon = @import("nd/Daemon.zig");
@@ -73,7 +74,7 @@ const stderr = std.io.getStdErr().writer();
 /// prints usage help text to stderr.
 fn usage(prog: []const u8) !void {
     try stderr.print(
-        \\usage: {[prog]s} -gui path/to/ngui -gui-user username -wpa path [-conf {[confpath]s}]
+        \\usage: {[prog]s} -gui path/to/ngui -gui-user username -wpa path [-conf {[confpath]s}] [-chain main|test|signet]
         \\
         \\nd is a short for nakamochi daemon.
         \\the daemon executes ngui as a child process and runs until
@@ -86,6 +87,7 @@ fn usage(prog: []const u8) !void {
 
 /// nd program flags. see usage.
 const NdArgs = struct {
+    chain: chain = .main,
     conf: ?[:0]const u8 = null,
     gui: ?[:0]const u8 = null,
     gui_user: ?[:0]const u8 = null,
@@ -112,6 +114,7 @@ fn parseArgs(gpa: std.mem.Allocator) !NdArgs {
 
     var lastarg: enum {
         none,
+        chain,
         conf,
         gui,
         gui_user,
@@ -119,6 +122,20 @@ fn parseArgs(gpa: std.mem.Allocator) !NdArgs {
     } = .none;
     while (args.next()) |a| {
         switch (lastarg) {
+            .chain => {
+                if (std.mem.eql(u8, a, "main")) {
+                    flags.chain = .main;
+                } else if (std.mem.eql(u8, a, "test")) {
+                    flags.chain = .test;
+                } else if (std.mem.eql(u8, a, "signet")) {
+                    flags.chain = .signet;
+                } else {
+                    logger.err("invalid chain name {s}", .{a});
+                    return error.InvalidChainName;
+                }
+                lastarg = .none;
+                continue;
+            },
             .conf => {
                 flags.conf = try gpa.dupeZ(u8, a);
                 lastarg = .none;
@@ -147,6 +164,8 @@ fn parseArgs(gpa: std.mem.Allocator) !NdArgs {
         } else if (std.mem.eql(u8, a, "-v")) {
             try stderr.print("{any}\n", .{buildopts.semver});
             std.process.exit(0);
+        } else if (std.mem.eql(u8, a, "-chain")) {
+            lastarg = .chain;
         } else if (std.mem.eql(u8, a, "-conf")) {
             lastarg = .conf;
         } else if (std.mem.eql(u8, a, "-gui")) {
@@ -165,6 +184,13 @@ fn parseArgs(gpa: std.mem.Allocator) !NdArgs {
         return error.MissinArgValue;
     }
 
+    if (flags.chain == .main) {
+        logger.info("chain: mainnet", .{});
+    } else if (flags.chain == .test) {
+        logger.info("chain: testnet3", .{});
+    } else if (flags.chain == .signet) {
+        logger.info("chain: signet", .{});
+    }
     if (flags.conf == null) {
         flags.conf = NdArgs.defaultConf;
     }
@@ -622,6 +648,7 @@ pub fn main() !void {
 
     var nd = try Daemon.init(.{
         .allocator = gpa,
+        .chain = args.chain,
         .conf = conf,
         .uir = uireader,
         .uiw = uiwriter,
